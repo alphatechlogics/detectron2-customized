@@ -8,6 +8,9 @@ import os
 import sys
 from typing import Any, ClassVar, Dict, List
 import torch
+import cv2
+import numpy as np
+from tqdm import tqdm
 
 from detectron2.config import CfgNode, get_cfg
 from detectron2.data.detection_utils import read_image
@@ -42,7 +45,7 @@ from densepose.vis.extractor import (
     create_extractor,
 )
 
-DOC = """Apply Net - a tool to print / visualize DensePose results
+DOC = """Apply Net - a tool to print / visualize DensePose results on images and videos
 """
 
 LOGGER_NAME = "apply_net"
@@ -77,12 +80,30 @@ class InferenceAction(Action):
         super(InferenceAction, cls).add_arguments(parser)
         parser.add_argument("cfg", metavar="<config>", help="Config file")
         parser.add_argument("model", metavar="<model>", help="Model file")
-        parser.add_argument("input", metavar="<input>", help="Input data")
+        parser.add_argument("input", metavar="<input>", help="Input data (image, video, or directory)")
         parser.add_argument(
             "--opts",
             help="Modify config options using the command-line 'KEY VALUE' pairs",
             default=[],
             nargs=argparse.REMAINDER,
+        )
+        parser.add_argument(
+            "--input_type",
+            choices=["auto", "image", "video"],
+            default="auto",
+            help="Specify input type (default: auto-detect based on file extension)",
+        )
+        parser.add_argument(
+            "--start_time",
+            type=float,
+            default=0.0,
+            help="Start time in seconds for video processing (default: 0.0)",
+        )
+        parser.add_argument(
+            "--end_time",
+            type=float,
+            default=-1.0,
+            help="End time in seconds for video processing (-1 means until the end, default: -1.0)",
         )
 
     @classmethod
@@ -93,17 +114,94 @@ class InferenceAction(Action):
         logger.info(f"Loading model from {args.model}")
         predictor = DefaultPredictor(cfg)
         logger.info(f"Loading data from {args.input}")
+        
+        input_type = args.input_type
+        if input_type == "auto":
+            # Auto-detect based on extension
+            if args.input.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm')):
+                input_type = "video"
+            else:
+                input_type = "image"
+        
+        context = cls.create_context(args, cfg)
+        
+        if input_type == "video":
+            cls._process_video(args, context, predictor)
+        else:
+            cls._process_images(args, context, predictor)
+            
+        cls.postexecute(context)
+
+    @classmethod
+    def _process_images(cls: type, args: argparse.Namespace, context: Dict[str, Any], predictor):
         file_list = cls._get_input_file_list(args.input)
         if len(file_list) == 0:
             logger.warning(f"No input images for {args.input}")
             return
-        context = cls.create_context(args, cfg)
+            
         for file_name in file_list:
             img = read_image(file_name, format="BGR")  # predictor expects BGR image.
             with torch.no_grad():
                 outputs = predictor(img)["instances"]
                 cls.execute_on_outputs(context, {"file_name": file_name, "image": img}, outputs)
-        cls.postexecute(context)
+
+    @classmethod
+    def _process_video(cls: type, args: argparse.Namespace, context: Dict[str, Any], predictor):
+        video_path = args.input
+        cap = cv2.VideoCapture(video_path)
+        
+        if not cap.isOpened():
+            logger.error(f"Could not open video: {video_path}")
+            return
+            
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        # Calculate start and end frames from time
+        start_frame = int(args.start_time * fps)
+        end_frame = int(args.end_time * fps) if args.end_time >= 0 else total_frames
+        
+        # Set up context for video output
+        context["video_info"] = {
+            "fps": fps,
+            "width": width,
+            "height": height,
+            "output_writer": None
+        }
+        
+        # Skip to start frame
+        if start_frame > 0:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            
+        frame_count = start_frame
+        
+        with tqdm(total=end_frame - start_frame) as pbar:
+            while frame_count < end_frame:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                # Create a file_name equivalent for video frames
+                frame_file_name = f"{os.path.splitext(video_path)[0]}_frame_{frame_count:06d}"
+                
+                with torch.no_grad():
+                    outputs = predictor(frame)["instances"]
+                    cls.execute_on_outputs(
+                        context, 
+                        {"file_name": frame_file_name, "image": frame, "frame_idx": frame_count}, 
+                        outputs
+                    )
+                
+                frame_count += 1
+                pbar.update(1)
+                
+        cap.release()
+        
+        # Close video writer if it exists
+        if "video_info" in context and context["video_info"].get("output_writer") is not None:
+            context["video_info"]["output_writer"].release()
 
     @classmethod
     def setup_config(
@@ -165,6 +263,8 @@ class DumpAction(InferenceAction):
         image_fpath = entry["file_name"]
         logger.info(f"Processing {image_fpath}")
         result = {"file_name": image_fpath}
+        if "frame_idx" in entry:
+            result["frame_idx"] = entry["frame_idx"]
         if outputs.has("scores"):
             result["scores"] = outputs.get("scores").cpu()
         if outputs.has("pred_boxes"):
@@ -196,7 +296,7 @@ class DumpAction(InferenceAction):
 @register_action
 class ShowAction(InferenceAction):
     """
-    Show action that visualizes selected entries on an image
+    Show action that visualizes selected entries on an image or video
     """
 
     COMMAND: ClassVar[str] = "show"
@@ -250,9 +350,9 @@ class ShowAction(InferenceAction):
         )
         parser.add_argument(
             "--output",
-            metavar="<image_file>",
+            metavar="<output_file>",
             default="outputres.png",
-            help="File name to save output to",
+            help="File name to save output to (will use format-specific extensions for videos)",
         )
 
     @classmethod
@@ -271,29 +371,69 @@ class ShowAction(InferenceAction):
     def execute_on_outputs(
         cls: type, context: Dict[str, Any], entry: Dict[str, Any], outputs: Instances
     ):
-        import cv2
-        import numpy as np
-
         visualizer = context["visualizer"]
         extractor = context["extractor"]
         image_fpath = entry["file_name"]
         logger.info(f"Processing {image_fpath}")
-        image = cv2.cvtColor(entry["image"], cv2.COLOR_BGR2GRAY)
-        image = np.tile(image[:, :, np.newaxis], [1, 1, 3])
+        
+        # Get image and convert to grayscale if needed
+        image = entry["image"]
+        if len(image.shape) == 3 and image.shape[2] == 3:
+            gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            image_vis_base = np.tile(gray_image[:, :, np.newaxis], [1, 1, 3])
+        else:
+            image_vis_base = image
+            
         data = extractor(outputs)
-        image_vis = visualizer.visualize(image, data)
-        entry_idx = context["entry_idx"] + 1
-        out_fname = cls._get_out_fname(entry_idx, context["out_fname"])
-        out_dir = os.path.dirname(out_fname)
-        if len(out_dir) > 0 and not os.path.exists(out_dir):
-            os.makedirs(out_dir)
-        cv2.imwrite(out_fname, image_vis)
-        logger.info(f"Output saved to {out_fname}")
-        context["entry_idx"] += 1
+        image_vis = visualizer.visualize(image_vis_base, data)
+        
+        # Handle video output if this is part of video processing
+        if "frame_idx" in entry:
+            frame_idx = entry["frame_idx"]
+            # Initialize video writer if not already done
+            if context["video_info"]["output_writer"] is None:
+                out_fname = context["out_fname"]
+                # Ensure we have a video extension
+                if not out_fname.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')):
+                    out_fname = os.path.splitext(out_fname)[0] + '.mp4'
+                    context["out_fname"] = out_fname
+                
+                # Create output directory if it doesn't exist
+                out_dir = os.path.dirname(out_fname)
+                if len(out_dir) > 0 and not os.path.exists(out_dir):
+                    os.makedirs(out_dir)
+                
+                # Create the video writer
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                video_writer = cv2.VideoWriter(
+                    out_fname,
+                    fourcc,
+                    context["video_info"]["fps"],
+                    (context["video_info"]["width"], context["video_info"]["height"])
+                )
+                context["video_info"]["output_writer"] = video_writer
+            
+            # Write the frame
+            context["video_info"]["output_writer"].write(image_vis)
+            if frame_idx % 100 == 0:
+                logger.info(f"Processed frame {frame_idx}")
+        else:
+            # This is an image, save it to file
+            entry_idx = context["entry_idx"] + 1
+            out_fname = cls._get_out_fname(entry_idx, context["out_fname"])
+            out_dir = os.path.dirname(out_fname)
+            if len(out_dir) > 0 and not os.path.exists(out_dir):
+                os.makedirs(out_dir)
+            cv2.imwrite(out_fname, image_vis)
+            logger.info(f"Output saved to {out_fname}")
+            context["entry_idx"] += 1
 
     @classmethod
     def postexecute(cls: type, context: Dict[str, Any]):
-        pass
+        # Close video writer if it exists
+        if "video_info" in context and context["video_info"].get("output_writer") is not None:
+            context["video_info"]["output_writer"].release()
+            logger.info(f"Video output saved to {context['out_fname']}")
 
     @classmethod
     def _get_out_fname(cls: type, entry_idx: int, fname_base: str):
@@ -323,6 +463,7 @@ class ShowAction(InferenceAction):
             "visualizer": visualizer,
             "out_fname": args.output,
             "entry_idx": 0,
+            "video_info": {"output_writer": None},
         }
         return context
 

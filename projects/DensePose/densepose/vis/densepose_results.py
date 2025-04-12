@@ -116,8 +116,9 @@ class DensePoseResultsMplContourVisualizer(DensePoseResultsVisualizer):
         w, h = map(int, fig.get_size_inches() * fig.get_dpi())
         canvas = context["canvas"]
         canvas.draw()
-        image_1d = np.fromstring(canvas.tostring_rgb(), dtype="uint8")
-        image_rgb = image_1d.reshape(h, w, 3)
+        image_1d = np.asarray(canvas.buffer_rgba(), dtype="uint8")
+        image_rgba = image_1d.reshape(h, w, 4)
+        image_rgb = image_rgba[:, :, :3]  # Drop the alpha channel
         image_bgr = image_rgb[:, :, ::-1].copy()
         return image_bgr
 
